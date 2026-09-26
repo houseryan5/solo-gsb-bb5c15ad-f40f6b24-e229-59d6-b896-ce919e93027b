@@ -301,5 +301,89 @@ class TestReprintEndpoint(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class TestChapterImposeEndpoint(unittest.TestCase):
+    CHAPTER_URL = "/api/v1/chapter-impose"
+
+    def test_valid_request_splits_and_imposes(self):
+        resp = client.post(
+            self.CHAPTER_URL,
+            json={"chapter_pages": [4, 4, 4, 4], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["chapter_pages"], [4, 4, 4, 4])
+        self.assertEqual(data["total_pages"], 16)
+        self.assertEqual(data["booklet_count"], 2)
+        self.assertEqual(data["total_sheets"], 4)
+
+        first, second = data["booklets"]
+        self.assertEqual((first["start_chapter"], first["end_chapter"]), (1, 2))
+        self.assertEqual((first["start_page"], first["end_page"]), (1, 8))
+        self.assertEqual(first["sheet_count"], 2)
+        self.assertEqual(first["blank_pages"], 0)
+        self.assertEqual(first["sheets"][0]["front"], {"left": 8, "right": 1})
+        self.assertEqual(first["sheets"][0]["back"], {"left": 2, "right": 7})
+        self.assertEqual((second["start_chapter"], second["end_chapter"]), (3, 4))
+        self.assertEqual((second["start_page"], second["end_page"]), (9, 16))
+        self.assertEqual(second["sheets"][0]["front"], {"left": 16, "right": 9})
+
+    def test_lexicographic_tie_break(self):
+        # [3,3,3] 容量 8：[1][2-3] 与 [1-2][3] 同为 3 张纸 2 册，取 (1,3)
+        resp = client.post(
+            self.CHAPTER_URL,
+            json={"chapter_pages": [3, 3, 3], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        booklets = resp.json()["booklets"]
+        self.assertEqual(
+            [(b["start_chapter"], b["end_chapter"]) for b in booklets],
+            [(1, 1), (2, 3)],
+        )
+
+    def test_blank_page_is_null(self):
+        resp = client.post(
+            self.CHAPTER_URL,
+            json={"chapter_pages": [5], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        booklet = resp.json()["booklets"][0]
+        self.assertEqual(booklet["blank_pages"], 3)
+        self.assertEqual(booklet["sheet_count"], 2)
+        self.assertEqual(booklet["sheets"][0]["front"]["left"], None)
+
+    def test_single_chapter_exceeding_capacity_rejected(self):
+        resp = client.post(
+            self.CHAPTER_URL,
+            json={"chapter_pages": [4, 9, 4], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertTrue(any("不可拆分" in d["message"] for d in body["details"]))
+
+    def test_invalid_inputs_rejected(self):
+        bad_payloads = [
+            {},  # 缺字段
+            {"chapter_pages": [], "max_sheets_per_booklet": 2},  # 空数组
+            {"chapter_pages": [0, 4], "max_sheets_per_booklet": 2},  # 非正整数
+            {"chapter_pages": [-1], "max_sheets_per_booklet": 2},
+            {"chapter_pages": [1.5, 4], "max_sheets_per_booklet": 2},  # 小数
+            {"chapter_pages": [4.0], "max_sheets_per_booklet": 2},  # 整数值浮点
+            {"chapter_pages": ["4"], "max_sheets_per_booklet": 2},  # 字符串
+            {"chapter_pages": [True], "max_sheets_per_booklet": 2},  # 布尔
+            {"chapter_pages": [None], "max_sheets_per_booklet": 2},  # 空值
+            {"chapter_pages": "4,4", "max_sheets_per_booklet": 2},  # 非数组
+            {"chapter_pages": [4], "max_sheets_per_booklet": 0},  # 上限非正
+            {"chapter_pages": [4], "max_sheets_per_booklet": 2.5},
+            {"chapter_pages": [4], "max_sheets_per_booklet": 2, "duplex": True},  # 多余字段
+        ]
+        for payload in bad_payloads:
+            resp = client.post(self.CHAPTER_URL, json=payload)
+            self.assertEqual(resp.status_code, 400, payload)
+            body = resp.json()
+            self.assertEqual(body["error"], "invalid_input")
+            self.assertIn("details", body)
+
+
 if __name__ == "__main__":
     unittest.main()

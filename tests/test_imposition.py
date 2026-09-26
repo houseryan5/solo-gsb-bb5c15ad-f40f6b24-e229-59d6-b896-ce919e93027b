@@ -3,10 +3,12 @@
 import unittest
 
 from app.imposition import (
+    build_chapter_imposition,
     build_imposition,
     build_reprint,
     impose_padded_booklet,
     split_booklets,
+    split_chapter_booklets,
 )
 
 
@@ -190,6 +192,143 @@ class TestBuildImposition(unittest.TestCase):
         self.assertEqual(result["max_sheets_per_booklet"], 2)
         self.assertEqual(result["booklet_count"], 3)
         self.assertEqual(result["total_sheets"], 2 + 2 + 1)
+
+
+class TestSplitChapterBooklets(unittest.TestCase):
+    def test_single_chapter_within_capacity(self):
+        ranges = split_chapter_booklets([5], max_sheets_per_booklet=2)
+        self.assertEqual(len(ranges), 1)
+        only = ranges[0]
+        self.assertEqual((only.start_chapter, only.end_chapter), (1, 1))
+        self.assertEqual((only.start_page, only.end_page), (1, 5))
+        self.assertEqual(only.padded_pages, 8)
+        self.assertEqual(only.blank_pages, 3)
+        self.assertEqual(only.sheet_count, 2)
+
+    def test_adjacent_chapters_combined_to_fill_capacity(self):
+        # 每册 2 张纸 = 8 页；4 章各 4 页 -> [1-2] [3-4]，无需补白
+        ranges = split_chapter_booklets([4, 4, 4, 4], max_sheets_per_booklet=2)
+        self.assertEqual(
+            [(r.start_chapter, r.end_chapter) for r in ranges],
+            [(1, 2), (3, 4)],
+        )
+        self.assertEqual(
+            [(r.start_page, r.end_page) for r in ranges],
+            [(1, 8), (9, 16)],
+        )
+        self.assertTrue(all(r.blank_pages == 0 for r in ranges))
+        self.assertEqual([r.index for r in ranges], [0, 1])
+
+    def test_total_sheets_minimized_before_booklet_count(self):
+        # [4,4] 容量 16：合册 8 页 2 张纸 1 册，优于分两册（同样 2 张纸但 2 册）
+        ranges = split_chapter_booklets([4, 4], max_sheets_per_booklet=4)
+        self.assertEqual(len(ranges), 1)
+        self.assertEqual((ranges[0].start_chapter, ranges[0].end_chapter), (1, 2))
+        self.assertEqual(ranges[0].sheet_count, 2)
+
+    def test_lexicographic_tie_break_on_ending_chapters(self):
+        # [3,3,3] 容量 8：[1][2-3] 与 [1-2][3] 同为 3 张纸 2 册，
+        # 结束章节序号序列 (1,3) 字典序小于 (2,3)
+        ranges = split_chapter_booklets([3, 3, 3], max_sheets_per_booklet=2)
+        self.assertEqual(
+            [(r.start_chapter, r.end_chapter) for r in ranges],
+            [(1, 1), (2, 3)],
+        )
+        self.assertEqual(
+            [(r.start_page, r.end_page) for r in ranges],
+            [(1, 3), (4, 9)],
+        )
+
+    def test_uneven_chapters(self):
+        # [2,6,4] 容量 8：第 2 章 6 页只能与第 1 章合册（6+4>8）
+        ranges = split_chapter_booklets([2, 6, 4], max_sheets_per_booklet=2)
+        self.assertEqual(
+            [(r.start_chapter, r.end_chapter) for r in ranges],
+            [(1, 2), (3, 3)],
+        )
+        self.assertEqual([r.sheet_count for r in ranges], [2, 1])
+        self.assertEqual(
+            [(r.start_page, r.end_page) for r in ranges],
+            [(1, 8), (9, 12)],
+        )
+
+    def test_oversized_chapter_rejected(self):
+        for chapters in ([9], [4, 9, 4], [1, 1, 17]):
+            with self.assertRaises(ValueError):
+                split_chapter_booklets(chapters, max_sheets_per_booklet=2)
+
+    def test_every_chapter_assigned_exactly_once(self):
+        for chapters, cap in (
+            ([1], 1),
+            ([3, 3, 3], 2),
+            ([4, 4, 4, 4], 2),
+            ([2, 6, 4, 1, 3], 3),
+            ([7, 1, 8, 2, 5, 5], 2),
+        ):
+            ranges = split_chapter_booklets(chapters, cap)
+            covered = []
+            for r in ranges:
+                covered.extend(range(r.start_chapter, r.end_chapter + 1))
+                # 每册页数不超容量
+                self.assertLessEqual(r.original_pages, 4 * cap)
+            self.assertEqual(covered, list(range(1, len(chapters) + 1)))
+
+
+class TestBuildChapterImposition(unittest.TestCase):
+    def test_layout_matches_continuous_imposition_structure(self):
+        # 单章 8 页、每册 2 张纸：与 impose(8, 2) 的拼版完全一致
+        result = build_chapter_imposition([8], max_sheets_per_booklet=2)
+        booklet = result["booklets"][0]
+        self.assertEqual(booklet["sheets"][0]["front"], {"left": 8, "right": 1})
+        self.assertEqual(booklet["sheets"][0]["back"], {"left": 2, "right": 7})
+        self.assertEqual(booklet["sheets"][1]["front"], {"left": 6, "right": 3})
+        self.assertEqual(booklet["sheets"][1]["back"], {"left": 4, "right": 5})
+
+    def test_chapter_and_page_ranges_and_summary(self):
+        result = build_chapter_imposition([4, 4, 4, 4], max_sheets_per_booklet=2)
+        self.assertEqual(result["chapter_pages"], [4, 4, 4, 4])
+        self.assertEqual(result["total_pages"], 16)
+        self.assertEqual(result["max_sheets_per_booklet"], 2)
+        self.assertEqual(result["booklet_count"], 2)
+        self.assertEqual(result["total_sheets"], 4)
+
+        first, second = result["booklets"]
+        self.assertEqual((first["start_chapter"], first["end_chapter"]), (1, 2))
+        self.assertEqual((first["start_page"], first["end_page"]), (1, 8))
+        self.assertEqual((second["start_chapter"], second["end_chapter"]), (3, 4))
+        self.assertEqual((second["start_page"], second["end_page"]), (9, 16))
+        # 第 2 册页码为全局原稿页码
+        self.assertEqual(second["sheets"][0]["front"], {"left": 16, "right": 9})
+
+    def test_blank_pages_are_null(self):
+        result = build_chapter_imposition([5], max_sheets_per_booklet=2)
+        booklet = result["booklets"][0]
+        self.assertEqual(booklet["blank_pages"], 3)
+        self.assertEqual(booklet["padded_pages"], 8)
+        self.assertEqual(booklet["sheets"][0]["front"], {"left": None, "right": 1})
+        self.assertEqual(booklet["sheets"][0]["back"], {"left": 2, "right": None})
+
+    def test_every_original_page_appears_exactly_once(self):
+        for chapters, cap in (
+            ([1], 1),
+            ([3, 3, 3], 2),
+            ([4, 4, 4, 4], 2),
+            ([2, 6, 4, 1, 3], 3),
+        ):
+            result = build_chapter_imposition(chapters, cap)
+            pages = []
+            for booklet in result["booklets"]:
+                for sheet in booklet["sheets"]:
+                    for side in ("front", "back"):
+                        for pos in ("left", "right"):
+                            value = sheet[side][pos]
+                            if value is not None:
+                                pages.append(value)
+            self.assertEqual(
+                sorted(pages),
+                list(range(1, sum(chapters) + 1)),
+                f"chapters={chapters}, cap={cap}",
+            )
 
 
 class TestBuildReprint(unittest.TestCase):
