@@ -6,8 +6,15 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .imposition import build_imposition, build_reprint
+from .imposition import (
+    ChapterTooLargeError,
+    build_chapter_imposition,
+    build_imposition,
+    build_reprint,
+)
 from .schemas import (
+    ChapterImpositionRequest,
+    ChapterImpositionResponse,
     ImpositionRequest,
     ImpositionResponse,
     ReprintRequest,
@@ -19,14 +26,15 @@ app = FastAPI(
     description=(
         "输入原稿总页数与每册最多纸张数，按骑马钉（对折装订）方式分册拼版，"
         "返回每张纸正反面各自的左、右页码；补位页以 null（空白）表示。"
+        "亦支持按章节分册：章节不可拆分、仅相邻章节可合册，"
+        "在所有合法分册方案中依次最小化总纸张数与册数。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
 def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
     """把 Pydantic 校验错误整理成简洁的中文说明。"""
-    is_reprint = path.startswith("/api/v1/reprint")
     formatted: list[dict] = []
     for err in errors:
         loc = [
@@ -59,10 +67,16 @@ def _format_validation_errors(errors: list[dict], path: str = "") -> list[dict]:
             elif field == "damaged_ranges":
                 message = "damaged_ranges 必须是区间对象组成的列表。"
         elif err_type == "list_type":
-            message = "damaged_ranges 必须是区间对象组成的非空列表。"
+            if field == "chapter_pages":
+                message = "chapter_pages 必须是由正整数页数组成的数组。"
+            else:
+                message = "damaged_ranges 必须是区间对象组成的非空列表。"
         elif err_type in {"too_short", "string_too_short"}:
-            message = "damaged_ranges 不能为空，至少提供一个受损页区间。"
-        elif err_type in {"reversed_range", "page_out_of_range"}:
+            if field == "chapter_pages":
+                message = "chapter_pages 不能为空，至少提供一个章节页数。"
+            else:
+                message = "damaged_ranges 不能为空，至少提供一个受损页区间。"
+        elif err_type in {"reversed_range", "page_out_of_range", "chapter_too_large"}:
             message = message.removeprefix("Value error, ")
 
         formatted.append({"field": field, "message": message})
@@ -74,8 +88,14 @@ async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     """类型 / 范围 / 区间错误统一返回 HTTP 400 与明确错误信息。"""
-    is_reprint = request.url.path.startswith("/api/v1/reprint")
-    if is_reprint:
+    path = request.url.path
+    if path.startswith("/api/v1/chapter-impose"):
+        message = (
+            "输入参数校验失败：chapter_pages 必须为非空的正整数页数数组，"
+            "max_sheets_per_booklet 必须是正整数，"
+            "且任一章节页数不能超过 4 × max_sheets_per_booklet。"
+        )
+    elif path.startswith("/api/v1/reprint"):
         message = (
             "输入参数校验失败：total_pages 与 max_sheets_per_booklet 必须是正整数，"
             "damaged_ranges 必须为非空的有效受损页区间列表。"
@@ -89,7 +109,7 @@ async def validation_exception_handler(
         content={
             "error": "invalid_input",
             "message": message,
-            "details": _format_validation_errors(exc.errors(), request.url.path),
+            "details": _format_validation_errors(exc.errors(), path),
         },
     )
 
@@ -102,6 +122,7 @@ async def root() -> dict:
         "health": "/health",
         "impose_endpoint": "/api/v1/impose",
         "reprint_endpoint": "/api/v1/reprint",
+        "chapter_impose_endpoint": "/api/v1/chapter-impose",
     }
 
 
@@ -156,3 +177,30 @@ async def reprint(payload: ReprintRequest) -> ReprintResponse:
         ],
     )
     return ReprintResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/chapter-impose",
+    response_model=ChapterImpositionResponse,
+    tags=["imposition"],
+    summary="按章节分册的骑马钉拼版（章节不可拆分，仅相邻章节可合册）",
+)
+async def chapter_impose(
+    payload: ChapterImpositionRequest,
+) -> ChapterImpositionResponse:
+    try:
+        result = build_chapter_imposition(
+            chapter_pages=payload.chapter_pages,
+            max_sheets_per_booklet=payload.max_sheets_per_booklet,
+        )
+    except ChapterTooLargeError as exc:
+        # 单章超容量在 schema 层已拦截，此处兜底保证仍返回 400 而非 500。
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_input",
+                "message": str(exc),
+                "details": [{"field": "chapter_pages", "message": str(exc)}],
+            },
+        )
+    return ChapterImpositionResponse.model_validate(result)

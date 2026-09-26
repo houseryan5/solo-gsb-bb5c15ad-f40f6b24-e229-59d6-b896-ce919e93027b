@@ -8,6 +8,10 @@
 3. 按纸张**从外到内**返回每张纸**正面（front）/反面（back）各自的左、右页码**，
    双面打印并对折后即可按原稿顺序翻阅。
 
+也支持**按章节分册**（`POST /api/v1/chapter-impose`）：输入有序章节页数数组，
+章节不可拆分、仅相邻章节可合册，服务在所有合法分册方案中依次最小化**总纸张数**与
+**册数**，并以各册结束章节序号序列的字典序裁决并列。
+
 > 1 张纸正反两面共 4 个版面，因此骑马钉册的页数永远是 4 的倍数。
 
 ---
@@ -62,6 +66,7 @@ HOST_PORT=9000
 | 拼版接口（POST） | `POST http://localhost:8000/api/v1/impose` |
 | 拼版接口（GET 便捷形式，可直接在浏览器打开） | `GET http://localhost:8000/api/v1/impose?total_pages=16&max_sheets_per_booklet=4` |
 | 补印定位接口（POST） | `POST http://localhost:8000/api/v1/reprint` |
+| 按章节分册拼版接口（POST） | `POST http://localhost:8000/api/v1/chapter-impose` |
 
 ## 4. 接口说明
 
@@ -268,6 +273,101 @@ curl -i -X POST http://localhost:8000/api/v1/reprint \
 }
 ```
 
+### `POST /api/v1/chapter-impose`（按章节分册拼版）
+
+输入**非空的有序章节页数数组**与每册最多纸张数。规则：
+
+- **章节不可拆分**，只有**相邻章节**可以合入同一册；
+- 每册页数不得超过 `4 × max_sheets_per_booklet`；
+- 在所有合法分册方案中，依次最小化 **① 总纸张数 → ② 册数**，
+  并以 **③ 各册结束章节序号序列的字典序**（小者优先）裁决并列；
+- 每册给出章节序号范围（`start_chapter` / `end_chapter`，1-based）、
+  **全局原稿页码范围**（`start_page` / `end_page`，跨册连续编号）、
+  纸张数与补白数，拼版结构与 `/api/v1/impose` 完全一致（补白为 `null`）。
+
+**请求体（JSON）**
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `chapter_pages` | 整数数组 | 必填，**非空**，每项为正整数 `>= 1` | 有序章节页数（第 1 章、第 2 章……） |
+| `max_sheets_per_booklet` | 整数 | 必填，正整数 `>= 1` | 每册最多纸张数（每册最多 `4 ×` 该值 个版面） |
+
+以下情况一律返回 **HTTP 400**：数组为空 / 缺失、页数不是正整数、
+`max_sheets_per_booklet` 非法、存在多余字段，以及**任一单章页数超过
+`4 × max_sheets_per_booklet`**（章节不可拆分，无法分册）。
+
+请求示例（3 章共 14 页、每册最多 2 张纸即 8 页）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/chapter-impose \
+  -H "Content-Type: application/json" \
+  -d '{"chapter_pages": [6, 5, 3], "max_sheets_per_booklet": 2}'
+```
+
+响应示例（第 1 章单独成册，第 2、3 章合册；共 2 册 4 张纸、2 个补白页）：
+
+```json
+{
+  "chapter_pages": [6, 5, 3],
+  "max_sheets_per_booklet": 2,
+  "chapter_count": 3,
+  "total_pages": 14,
+  "booklet_count": 2,
+  "total_sheets": 4,
+  "total_blank_pages": 2,
+  "booklets": [
+    {
+      "index": 0,
+      "start_chapter": 1,
+      "end_chapter": 1,
+      "start_page": 1,
+      "end_page": 6,
+      "original_pages": 6,
+      "padded_pages": 8,
+      "blank_pages": 2,
+      "sheet_count": 2,
+      "sheets": [
+        { "index": 0, "front": { "left": null, "right": 1 }, "back": { "left": 2, "right": null } },
+        { "index": 1, "front": { "left": 6, "right": 3 }, "back": { "left": 4, "right": 5 } }
+      ]
+    },
+    {
+      "index": 1,
+      "start_chapter": 2,
+      "end_chapter": 3,
+      "start_page": 7,
+      "end_page": 14,
+      "original_pages": 8,
+      "padded_pages": 8,
+      "blank_pages": 0,
+      "sheet_count": 2,
+      "sheets": [
+        { "index": 0, "front": { "left": 14, "right": 7 }, "back": { "left": 8, "right": 13 } },
+        { "index": 1, "front": { "left": 12, "right": 9 }, "back": { "left": 10, "right": 11 } }
+      ]
+    }
+  ]
+}
+```
+
+单章超容量错误响应示例（容量 8 页，第 2 章 9 页）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/chapter-impose \
+  -H "Content-Type: application/json" \
+  -d '{"chapter_pages": [4, 9, 4], "max_sheets_per_booklet": 2}'
+```
+
+```json
+{
+  "error": "invalid_input",
+  "message": "输入参数校验失败：chapter_pages 必须为非空的正整数页数数组，max_sheets_per_booklet 必须是正整数，且任一章节页数不能超过 4 × max_sheets_per_booklet。",
+  "details": [
+    { "field": "chapter_pages", "message": "第 2 章共 9 页，超过单册容量上限 8 页（4 × max_sheets_per_booklet），章节不可拆分。" }
+  ]
+}
+```
+
 ## 5. 拼版规则（打印与装订说明）
 
 对一册补齐到 `n` 页（`n` 为 4 的倍数）的小册子，从外到内第 `i` 张纸
@@ -284,6 +384,11 @@ curl -i -X POST http://localhost:8000/api/v1/reprint \
 
 **分册规则**：除最后一册外，每册都装满 `4 × max_sheets_per_booklet` 个版面；
 剩余原稿页归入最后一册，并仅对该册补空白页到 4 的倍数。
+
+**按章节分册规则**（`/api/v1/chapter-impose`）：章节不可拆分、仅相邻章节可合册，
+每册页数不超过 `4 × max_sheets_per_booklet`；在所有合法方案中依次最小化
+总纸张数、册数，并以各册结束章节序号序列的字典序裁决并列。每册独立补齐到
+4 的倍数（可能每册都有补白页），页码为跨册连续的全局原稿页码。
 
 ## 6. 本地开发（不使用 Docker）
 
@@ -309,9 +414,9 @@ python -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位（纯标准库）
-│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间校验）
-│   └── main.py            # FastAPI 路由（拼版、补印）与 400 错误处理
+│   ├── imposition.py      # 分册 / 补齐 / 拼版核心算法 + 补印定位 + 按章节最优分册（纯标准库）
+│   ├── schemas.py         # Pydantic 请求与响应模型（正整数 / 受损区间 / 章节容量校验）
+│   └── main.py            # FastAPI 路由（拼版、补印、按章节拼版）与 400 错误处理
 ├── tests/
 │   ├── test_imposition.py # 核心算法单元测试
 │   └── test_api.py        # API 与非法输入测试

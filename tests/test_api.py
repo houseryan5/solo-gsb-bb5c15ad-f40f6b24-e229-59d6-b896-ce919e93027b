@@ -301,5 +301,97 @@ class TestReprintEndpoint(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class TestChapterImposeEndpoint(unittest.TestCase):
+    URL = "/api/v1/chapter-impose"
+
+    def test_valid_request_merges_adjacent_chapters(self):
+        resp = client.post(
+            self.URL,
+            json={"chapter_pages": [6, 5, 3], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["chapter_pages"], [6, 5, 3])
+        self.assertEqual(data["chapter_count"], 3)
+        self.assertEqual(data["total_pages"], 14)
+        self.assertEqual(data["booklet_count"], 2)
+        self.assertEqual(data["total_sheets"], 4)
+        self.assertEqual(data["total_blank_pages"], 2)
+
+        first, second = data["booklets"]
+        self.assertEqual((first["start_chapter"], first["end_chapter"]), (1, 1))
+        self.assertEqual((first["start_page"], first["end_page"]), (1, 6))
+        self.assertEqual(first["sheet_count"], 2)
+        self.assertEqual(first["blank_pages"], 2)
+        # 补白位为 null
+        self.assertIsNone(first["sheets"][0]["front"]["left"])
+        self.assertIsNone(first["sheets"][0]["back"]["right"])
+        self.assertEqual(first["sheets"][1]["front"], {"left": 6, "right": 3})
+
+        self.assertEqual((second["start_chapter"], second["end_chapter"]), (2, 3))
+        self.assertEqual((second["start_page"], second["end_page"]), (7, 14))
+        self.assertEqual(second["blank_pages"], 0)
+        # 页码为全局原稿页码
+        self.assertEqual(second["sheets"][0]["front"], {"left": 14, "right": 7})
+
+    def test_min_sheets_then_booklet_count_then_lexicographic(self):
+        # [4,1,4] 容量 8：最优 3 张纸、2 册；[4][1,4] 与 [4,1][4] 并列，
+        # 结束章节序号序列 [1,3] < [2,3] -> 选 [4][1,4]
+        resp = client.post(
+            self.URL,
+            json={"chapter_pages": [4, 1, 4], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["total_sheets"], 3)
+        self.assertEqual(data["booklet_count"], 2)
+        self.assertEqual(
+            [(b["start_chapter"], b["end_chapter"]) for b in data["booklets"]],
+            [(1, 1), (2, 3)],
+        )
+
+    def test_single_chapter_over_capacity_rejected(self):
+        resp = client.post(
+            self.URL,
+            json={"chapter_pages": [4, 9, 4], "max_sheets_per_booklet": 2},
+        )
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertEqual(body["error"], "invalid_input")
+        self.assertTrue(
+            any("chapter_pages" in d["field"] for d in body["details"])
+        )
+        self.assertTrue(
+            any("超过单册容量上限" in d["message"] for d in body["details"])
+        )
+
+    def test_invalid_payloads_rejected(self):
+        cases = [
+            {},  # 缺少必填参数
+            {"max_sheets_per_booklet": 2},  # 缺 chapter_pages
+            {"chapter_pages": [4]},  # 缺 max_sheets_per_booklet
+            {"chapter_pages": [], "max_sheets_per_booklet": 2},  # 空数组
+            {"chapter_pages": [0, 4], "max_sheets_per_booklet": 2},  # 非正整数页数
+            {"chapter_pages": [-1], "max_sheets_per_booklet": 2},  # 负数页数
+            {"chapter_pages": [4.5, 4], "max_sheets_per_booklet": 2},  # 小数页数
+            {"chapter_pages": [4.0, 4], "max_sheets_per_booklet": 2},  # 整数浮点
+            {"chapter_pages": ["4", 4], "max_sheets_per_booklet": 2},  # 数字字符串
+            {"chapter_pages": [True, 4], "max_sheets_per_booklet": 2},  # 布尔值
+            {"chapter_pages": [4, None], "max_sheets_per_booklet": 2},  # null 项
+            {"chapter_pages": "4,5", "max_sheets_per_booklet": 2},  # 非数组
+            {"chapter_pages": [4], "max_sheets_per_booklet": 0},  # 上限非正
+            {"chapter_pages": [4], "max_sheets_per_booklet": 2.5},  # 上限小数
+            {"chapter_pages": [4], "max_sheets_per_booklet": True},  # 上限布尔
+            {"chapter_pages": [4], "max_sheets_per_booklet": 2, "duplex": True},  # 多余字段
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                resp = client.post(self.URL, json=payload)
+                self.assertEqual(resp.status_code, 400)
+                body = resp.json()
+                self.assertEqual(body["error"], "invalid_input")
+                self.assertIn("details", body)
+
+
 if __name__ == "__main__":
     unittest.main()
